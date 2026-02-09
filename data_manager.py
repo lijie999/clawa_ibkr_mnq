@@ -24,36 +24,22 @@ class DataManager:
         self.contract = None
         self.data_dirty = False
         
-        self.df_1min: pd.DataFrame = pd.DataFrame()
-        self.df_5min: pd.DataFrame = pd.DataFrame()
-        self.df_15min: pd.DataFrame = pd.DataFrame()
-        self.df_1hr: pd.DataFrame = pd.DataFrame()
-        self.df_4hr: pd.DataFrame = pd.DataFrame()
+        self.df_1min = pd.DataFrame()
+        self.df_5min = pd.DataFrame()
+        self.df_15min = pd.DataFrame()
+        self.df_1hr = pd.DataFrame()
+        self.df_4hr = pd.DataFrame()
         
         self.timeframes = {
-            '1min': {'data': None, 'bars': 2880},
-            '5min': {'data': None, 'bars': 576},
-            '15min': {'data': None, 'bars': 192},
-            '1hr': {'data': None, 'bars': 48},
-            '4hr': {'data': None, 'bars': 12},
+            '1min': None,
+            '5min': None,
+            '15min': None,
+            '1hr': None,
+            '4hr': None,
         }
         
         self.historical_file = 'mnq_1min_20260209_010602.csv'
         self.live_file = 'mnq_1min_live.csv'
-    
-    def _tz_convert_safe(self, df: pd.DataFrame) -> pd.DataFrame:
-        """安全处理时区"""
-        if df.empty:
-            return df
-        if isinstance(df.index, pd.DatetimeIndex):
-            if df.index.tz is not None:
-                df.index = df.index.tz_convert(None)
-            elif str(df.index.tzinfo) != 'None':
-                try:
-                    df.index = df.index.tz_localize(None)
-                except:
-                    pass
-        return df
     
     def initialize(self, ib, contract):
         """初始化数据管理器"""
@@ -71,6 +57,15 @@ class DataManager:
         logger.info(f"   1hr: {len(self.df_1hr)} 根")
         logger.info(f"   4hr: {len(self.df_4hr)} 根")
     
+    def _ensure_datetimeindex(self, df):
+        """确保DataFrame有DatetimeIndex"""
+        if df.empty:
+            return df
+        if not isinstance(df.index, pd.DatetimeIndex):
+            df.index = pd.to_datetime(df.index, utc=True)
+            df.index = df.index.tz_localize(None)
+        return df
+    
     def _load_historical_data(self):
         """加载历史1分钟数据"""
         import os
@@ -78,14 +73,14 @@ class DataManager:
         if os.path.exists(self.historical_file):
             df = pd.read_csv(self.historical_file, parse_dates=['date'])
             df.set_index('date', inplace=True)
-            df = self._tz_convert_safe(df)
+            df = self._ensure_datetimeindex(df)
             self.df_1min = df
             logger.info(f"✅ 加载历史数据: {len(df)} 根1分钟K线")
         
         if os.path.exists(self.live_file):
             df_live = pd.read_csv(self.live_file, parse_dates=['date'])
             df_live.set_index('date', inplace=True)
-            df_live = self._tz_convert_safe(df_live)
+            df_live = self._ensure_datetimeindex(df_live)
             
             if not self.df_1min.empty:
                 combined = pd.concat([self.df_1min, df_live])
@@ -129,7 +124,7 @@ class DataManager:
             
             df_new['date'] = pd.to_datetime(df_new['date'], utc=True)
             df_new.set_index('date', inplace=True)
-            df_new = self._tz_convert_safe(df_new)
+            df_new = self._ensure_datetimeindex(df_new)
             
             if not self.df_1min.empty:
                 combined = pd.concat([self.df_1min, df_new])
@@ -164,11 +159,11 @@ class DataManager:
         self.df_1hr = self._resample_dataframe(self.df_1min, '60min')
         self.df_4hr = self._resample_dataframe(self.df_1min, '240min')
         
-        self.timeframes['1min']['data'] = self.df_1min
-        self.timeframes['5min']['data'] = self.df_5min
-        self.timeframes['15min']['data'] = self.df_15min
-        self.timeframes['1hr']['data'] = self.df_1hr
-        self.timeframes['4hr']['data'] = self.df_4hr
+        self.timeframes['1min'] = self.df_1min
+        self.timeframes['5min'] = self.df_5min
+        self.timeframes['15min'] = self.df_15min
+        self.timeframes['1hr'] = self.df_1hr
+        self.timeframes['4hr'] = self.df_4hr
     
     def _resample_dataframe(self, df: pd.DataFrame, freq: str) -> pd.DataFrame:
         """聚合K线"""
@@ -215,7 +210,7 @@ class DataManager:
             
             new_bar['date'] = pd.to_datetime(new_bar['date'], utc=True)
             new_bar.set_index('date', inplace=True)
-            new_bar = self._tz_convert_safe(new_bar)
+            new_bar = self._ensure_datetimeindex(new_bar)
             
             if not self.df_1min.empty:
                 last_time = self.df_1min.index[-1]
@@ -241,7 +236,7 @@ class DataManager:
     
     def get_data(self, timeframe: str = '15min') -> pd.DataFrame:
         """获取指定时间框架数据"""
-        return self.timeframes.get(timeframe, {}).get('data', pd.DataFrame())
+        return self.timeframes.get(timeframe, pd.DataFrame())
     
     def get_current_price(self) -> float:
         """获取当前价格"""
