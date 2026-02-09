@@ -58,13 +58,28 @@ class DataManager:
         logger.info(f"   4hr: {len(self.df_4hr)} 根")
     
     def _ensure_datetimeindex(self, df):
-        """确保DataFrame有DatetimeIndex"""
+        """确保DataFrame有DatetimeIndex且无时区"""
         if df.empty:
             return df
         if not isinstance(df.index, pd.DatetimeIndex):
             df.index = pd.to_datetime(df.index, utc=True)
+        # 移除时区信息，统一使用无时区
+        if df.index.tz is not None:
             df.index = df.index.tz_localize(None)
         return df
+    
+    def _convert_ibkr_bar(self, bar):
+        """转换IBKR K线数据"""
+        dt = pd.to_datetime(bar.date, utc=True)
+        dt = dt.tz_localize(None)
+        return {
+            'date': dt,
+            'open': bar.open,
+            'high': bar.high,
+            'low': bar.low,
+            'close': bar.close,
+            'volume': bar.volume
+        }
     
     def _load_historical_data(self):
         """加载历史1分钟数据"""
@@ -113,18 +128,8 @@ class DataManager:
                 logger.warning("未获取到K线数据")
                 return
             
-            df_new = pd.DataFrame([{
-                'date': bar.date,
-                'open': bar.open,
-                'high': bar.high,
-                'low': bar.low,
-                'close': bar.close,
-                'volume': bar.volume
-            } for bar in bars])
-            
-            df_new['date'] = pd.to_datetime(df_new['date'], utc=True)
+            df_new = pd.DataFrame([self._convert_ibkr_bar(bar) for bar in bars])
             df_new.set_index('date', inplace=True)
-            df_new = self._ensure_datetimeindex(df_new)
             
             if not self.df_1min.empty:
                 combined = pd.concat([self.df_1min, df_new])
@@ -199,18 +204,8 @@ class DataManager:
             if not bars:
                 return False
             
-            new_bar = pd.DataFrame([{
-                'date': bars[-1].date,
-                'open': bars[-1].open,
-                'high': bars[-1].high,
-                'low': bars[-1].low,
-                'close': bars[-1].close,
-                'volume': bars[-1].volume
-            }])
-            
-            new_bar['date'] = pd.to_datetime(new_bar['date'], utc=True)
+            new_bar = pd.DataFrame([self._convert_ibkr_bar(bars[-1])])
             new_bar.set_index('date', inplace=True)
-            new_bar = self._ensure_datetimeindex(new_bar)
             
             if not self.df_1min.empty:
                 last_time = self.df_1min.index[-1]
