@@ -24,38 +24,44 @@ class DataManager:
         self.contract = None
         self.data_dirty = False
         
-        # 数据存储
         self.df_1min: pd.DataFrame = pd.DataFrame()
         self.df_5min: pd.DataFrame = pd.DataFrame()
         self.df_15min: pd.DataFrame = pd.DataFrame()
         self.df_1hr: pd.DataFrame = pd.DataFrame()
         self.df_4hr: pd.DataFrame = pd.DataFrame()
         
-        # K线周期配置
         self.timeframes = {
-            '1min': {'data': None, 'bars': 2880},      # 2天
-            '5min': {'data': None, 'bars': 576},       # 2天
-            '15min': {'data': None, 'bars': 192},     # 2天
-            '1hr': {'data': None, 'bars': 48},         # 2天
-            '4hr': {'data': None, 'bars': 12},         # 2天
+            '1min': {'data': None, 'bars': 2880},
+            '5min': {'data': None, 'bars': 576},
+            '15min': {'data': None, 'bars': 192},
+            '1hr': {'data': None, 'bars': 48},
+            '4hr': {'data': None, 'bars': 12},
         }
         
-        # 历史文件
         self.historical_file = 'mnq_1min_20260209_010602.csv'
         self.live_file = 'mnq_1min_live.csv'
+    
+    def _tz_convert_safe(self, df: pd.DataFrame) -> pd.DataFrame:
+        """安全处理时区"""
+        if df.empty:
+            return df
+        if isinstance(df.index, pd.DatetimeIndex):
+            if df.index.tz is not None:
+                df.index = df.index.tz_convert(None)
+            elif str(df.index.tzinfo) != 'None':
+                try:
+                    df.index = df.index.tz_localize(None)
+                except:
+                    pass
+        return df
     
     def initialize(self, ib, contract):
         """初始化数据管理器"""
         self.ib = ib
         self.contract = contract
         
-        # 加载历史数据
         self._load_historical_data()
-        
-        # 同步最新数据
         self._sync_latest_data()
-        
-        # 聚合所有时间框架
         self._aggregate_all_timeframes()
         
         logger.info(f"✅ DataManager初始化完成")
@@ -69,22 +75,19 @@ class DataManager:
         """加载历史1分钟数据"""
         import os
         
-        # 首先尝试加载历史文件
         if os.path.exists(self.historical_file):
             df = pd.read_csv(self.historical_file, parse_dates=['date'])
             df.set_index('date', inplace=True)
-            df = df.tz_localize(None)
+            df = self._tz_convert_safe(df)
             self.df_1min = df
             logger.info(f"✅ 加载历史数据: {len(df)} 根1分钟K线")
         
-        # 加载实时数据（如果有）
         if os.path.exists(self.live_file):
             df_live = pd.read_csv(self.live_file, parse_dates=['date'])
             df_live.set_index('date', inplace=True)
-            df_live = df_live.tz_localize(None)
+            df_live = self._tz_convert_safe(df_live)
             
             if not self.df_1min.empty:
-                # 合并并去重，实时数据优先
                 combined = pd.concat([self.df_1min, df_live])
                 combined = combined[~combined.index.duplicated(keep='last')]
                 combined = combined.sort_index()
@@ -101,7 +104,6 @@ class DataManager:
             return
         
         try:
-            # 获取最近2天的1分钟数据
             bars = self.ib.reqHistoricalData(
                 self.contract,
                 endDateTime='',
@@ -116,7 +118,6 @@ class DataManager:
                 logger.warning("未获取到K线数据")
                 return
             
-            # 转换数据
             df_new = pd.DataFrame([{
                 'date': bar.date,
                 'open': bar.open,
@@ -128,9 +129,8 @@ class DataManager:
             
             df_new['date'] = pd.to_datetime(df_new['date'], utc=True)
             df_new.set_index('date', inplace=True)
-            df_new = df_new.tz_localize(None)
+            df_new = self._tz_convert_safe(df_new)
             
-            # 去重并合并
             if not self.df_1min.empty:
                 combined = pd.concat([self.df_1min, df_new])
                 combined = combined[~combined.index.duplicated(keep='last')]
@@ -138,10 +138,7 @@ class DataManager:
             else:
                 combined = df_new
             
-            # 只保留最近2880根（2天）
             self.df_1min = combined.tail(2880)
-            
-            # 保存到实时文件
             self._save_live_data()
             
             logger.info(f"✅ 同步完成: {len(df_new)} 根新数据")
@@ -167,7 +164,6 @@ class DataManager:
         self.df_1hr = self._resample_dataframe(self.df_1min, '60min')
         self.df_4hr = self._resample_dataframe(self.df_1min, '240min')
         
-        # 更新引用
         self.timeframes['1min']['data'] = self.df_1min
         self.timeframes['5min']['data'] = self.df_5min
         self.timeframes['15min']['data'] = self.df_15min
@@ -195,7 +191,6 @@ class DataManager:
             return False
         
         try:
-            # 获取最新1根1分钟K线
             bars = self.ib.reqHistoricalData(
                 self.contract,
                 endDateTime='',
@@ -209,7 +204,6 @@ class DataManager:
             if not bars:
                 return False
             
-            # 转换
             new_bar = pd.DataFrame([{
                 'date': bars[-1].date,
                 'open': bars[-1].open,
@@ -221,30 +215,20 @@ class DataManager:
             
             new_bar['date'] = pd.to_datetime(new_bar['date'], utc=True)
             new_bar.set_index('date', inplace=True)
-            new_bar = new_bar.tz_localize(None)
+            new_bar = self._tz_convert_safe(new_bar)
             
-            # 检查是否是新K线
             if not self.df_1min.empty:
                 last_time = self.df_1min.index[-1]
                 new_time = new_bar.index[0]
                 
                 if new_time <= last_time:
-                    # K线未更新，跳过
                     return False
             
-            # 追加新K线
             self.df_1min = pd.concat([self.df_1min, new_bar])
-            
-            # 去重（防止重复）
             self.df_1min = self.df_1min[~self.df_1min.index.duplicated(keep='last')]
-            
-            # 只保留最近2880根
             self.df_1min = self.df_1min.tail(2880)
             
-            # 保存
             self._save_live_data()
-            
-            # 重新聚合
             self._aggregate_all_timeframes()
             
             logger.debug(f"📊 新K线: {new_bar.index[0]} | O:{new_bar.iloc[0]['open']} H:{new_bar.iloc[0]['high']} L:{new_bar.iloc[0]['low']} C:{new_bar.iloc[0]['close']}")
