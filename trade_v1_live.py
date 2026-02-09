@@ -1,37 +1,47 @@
 #!/usr/bin/env python3
 """
-CLAWA IBKR MNQ V1.0 实盘交易系统
+CLAWA IBKR MNQ V1.0 实盘交易系统 (多时间框架版)
 
-连接 IBKR Gateway 获取实时数据运行
-如果连接失败，提示用户检查 Gateway 客户端
+数据流:
+IBKR Gateway → 1分钟K线 → 本地存储 → 多时间框架聚合 → 策略分析
+
+时间框架:
+- 1min: 数据存储 (2天)
+- 5min: 精确入场 (2天)
+- 15min: 入场信号 (2天)
+- 1hr: 趋势确认 (2天)
+- 4hr: 主要趋势 (2天)
 """
-
-import nest_asyncio
-nest_asyncio.apply()
 
 import signal
 import asyncio
+import nest_asyncio
+nest_asyncio.apply()
+
 from datetime import datetime
 import pandas as pd
 from config import Config
 from logger import logger
 from strategy_v1 import ICTSMCV1Strategy, RiskManagerV1
+from data_manager import DataManager
 from ib_insync import IB, Future
 
 
 class LiveTradingV1:
-    """IBKR 实盘交易"""
+    """IBKR 实盘交易 V1.0"""
     
     def __init__(self, initial_capital=100000):
         self.capital = initial_capital
         self.strategy = ICTSMCV1Strategy()
         self.risk = RiskManagerV1()
+        self.data_manager = DataManager()
         self.running = False
         self.ib = None
         self.contract = None
         self.orders = []
         self.trade_history = []
         self.daily_pnl = 0.0
+        self.last_update = None
     
     def connect_ibkr(self) -> bool:
         """连接 IBKR Gateway"""
@@ -66,16 +76,9 @@ class LiveTradingV1:
             logger.error("请检查以下项目:")
             logger.error("1. IBKR Gateway/TWS 是否正在运行")
             logger.error(f"2. API 端口是否正确配置为: {Config.IBKR_PORT}")
-            logger.error("3. 是否启用了 API 连接 (勾选 'Enable ActiveX and Socket Clients')")
+            logger.error("3. 是否启用了 API 连接")
             logger.error("4. 防火墙是否允许连接")
-            logger.error("")
-            logger.error("如何启用 IBKR API:")
-            logger.error("- 打开 IBKR Gateway 或 TWS")
-            logger.error("- 进入 'Configuration' -> 'API' -> 'Settings'")
-            logger.error("- 勾选 'Enable ActiveX and Socket Clients'")
-            logger.error("- 确保端口设置为: 7497 (模拟) 或 4002 (实盘)")
             logger.error("=" * 60)
-            logger.error("")
             return False
     
     def disconnect_ibkr(self):
@@ -84,68 +87,54 @@ class LiveTradingV1:
             self.ib.disconnect()
             logger.info("已断开 IBKR Gateway 连接")
     
-    def get_market_data(self) -> pd.DataFrame:
-        """获取实时市场数据"""
-        if not self.ib or not self.ib.isConnected():
-            return None
-        
-        try:
-            bars = self.ib.reqHistoricalData(
-                self.contract,
-                endDateTime='',
-                durationStr='1 D',
-                barSizeSetting='15 mins',
-                whatToShow='TRADES',
-                useRTH=True,
-                formatDate=1
-            )
-            
-            if not bars:
-                return None
-            
-            df = pd.DataFrame([{
-                'date': bar.date,
-                'open': bar.open,
-                'high': bar.high,
-                'low': bar.low,
-                'close': bar.close,
-                'volume': bar.volume
-            } for bar in bars])
-            
-            df['date'] = pd.to_datetime(df['date'], utc=True)
-            df.set_index('date', inplace=True)
-            return df
-            
-        except Exception as e:
-            logger.error(f"获取市场数据失败: {e}")
-            return None
+    def initialize_data(self):
+        """初始化数据管理器"""
+        self.data_manager.initialize(self.ib, self.contract)
+    
+    def get_multi_timeframe_data(self) -> dict:
+        """获取多时间框架数据"""
+        return {
+            '4hr': self.data_manager.get_data('4hr'),
+            '1hr': self.data_manager.get_data('1hr'),
+            '15min': self.data_manager.get_data('15min'),
+            '5min': self.data_manager.get_data('5min'),
+            '1min': self.data_manager.get_data('1min'),
+        }
     
     async def run(self):
         """主循环"""
-        # 连接 IBKR
         if not self.connect_ibkr():
             return False
+        
+        self.initialize_data()
         
         self.running = True
         
         logger.info("")
         logger.info("=" * 60)
-        logger.info("🚀 V1.0 实盘交易系统启动")
+        logger.info("🚀 V1.0 实盘交易系统启动 (多时间框架)")
         logger.info("=" * 60)
         logger.info(f"初始资金: ${self.capital:,.2f}")
         logger.info(f"交易合约: {Config.SYMBOL} ({Config.EXCHANGE})")
         logger.info(f"交易时段: 07:00-20:00 CST")
-        logger.info(f"策略: ICT/SMC 移动止损 V1.0")
+        logger.info(f"策略: ICT/SMC 移动止损 V1.0 (MTF)")
         logger.info("=" * 60)
         
+        # 显示数据状态
+        bar_counts = self.data_manager.get_bar_count()
+        logger.info("📊 数据状态:")
+        for tf, count in bar_counts.items():
+            logger.info(f"   {tf}: {count} 根K线")
+        
         last_date = None
+        last_minute = None
         
         while self.running:
             try:
                 now = datetime.now()
                 today = now.date()
+                current_minute = now.minute
                 
-                # 检查是否新的一天
                 if last_date != today:
                     last_date = today
                     self.daily_pnl = 0.0
@@ -155,30 +144,43 @@ class LiveTradingV1:
                 
                 if not session:
                     if now.minute % 30 == 0:
-                        logger.debug(f"当前 {now.strftime('%H:%M')} 不在交易时段 (7:00-20:00 CST)")
-                    await asyncio.sleep(60)
-                    continue
-                
-                # 获取市场数据
-                df = self.get_market_data()
-                
-                if df is None or df.empty or len(df) < 20:
+                        logger.debug(f"当前 {now.strftime('%H:%M')} 不在交易时段")
                     await asyncio.sleep(30)
                     continue
                 
-                current_price = float(df['close'].iloc[-1])
+                # 每1分钟更新数据
+                if current_minute != last_minute:
+                    updated = self.data_manager.update()
+                    if updated:
+                        bar_counts = self.data_manager.get_bar_count()
+                        logger.debug(f"📊 更新: {bar_counts}")
+                    last_minute = current_minute
+                
+                # 获取多时间框架数据
+                mtf_data = self.get_multi_timeframe_data()
+                
+                if mtf_data['15min'].empty or len(mtf_data['15min']) < 20:
+                    await asyncio.sleep(30)
+                    continue
+                
+                current_price = self.data_manager.get_current_price()
+                
+                if current_price <= 0:
+                    await asyncio.sleep(30)
+                    continue
                 
                 # 检查风险管理
                 if not self.risk.should_trade(self.capital, self.daily_pnl):
-                    logger.warning("风险管理阻止交易")
-                    await asyncio.sleep(60)
+                    if now.minute % 10 == 0:
+                        logger.warning("风险管理阻止交易")
+                    await asyncio.sleep(30)
                     continue
                 
                 # 策略逻辑
                 status = self.strategy.get_status()
                 
                 if status['status'] == 'idle':
-                    signal = self.strategy.generate_signal(df, current_price)
+                    signal = self.strategy.generate_signal(mtf_data, current_price, now)
                     if signal:
                         size = self.risk.calculate_position_size(
                             self.capital,
@@ -205,14 +207,13 @@ class LiveTradingV1:
                             logger.info(f"   入场价: ${current_price:.2f}")
                             logger.info(f"   止损价: ${signal['stop_loss']:.2f}")
                             logger.info(f"   置信度: {signal['confidence']:.0%}")
+                            logger.info(f"   趋势: 4hr={signal.get('trend_4hr', '?')} | 1hr={signal.get('trend_1hr', '?')} | 15min={signal.get('trend_15min', '?')}")
                             logger.info("=" * 60)
                             
                             # 发送订单
-                            order_id = self.ib.placeOrder(
-                                self.contract,
-                                self.ib.marketOrder(signal['action'], size)
-                            )
-                            logger.info(f"   订单ID: {order_id}")
+                            order = self.ib.marketOrder(signal['action'], size)
+                            trade = self.ib.placeOrder(self.contract, order)
+                            logger.info(f"   订单ID: {trade.order.orderId}")
                 
                 elif status['status'] == 'active':
                     result = self.strategy.update_trade(current_price, now)
@@ -225,18 +226,15 @@ class LiveTradingV1:
                         logger.info(f"   新止损: ${result['new_stop_loss']:.2f}")
                         logger.info("-" * 60)
                         
-                        # 发送半仓平仓订单
                         close_size = self.strategy.active_trade.get('partial_size', 0)
                         if close_size > 0:
                             action = 'SELL' if self.strategy.active_trade['action'] == 'BUY' else 'BUY'
-                            self.ib.placeOrder(
-                                self.contract,
-                                self.ib.marketOrder(action, close_size)
-                            )
+                            order = self.ib.marketOrder(action, close_size)
+                            self.ib.placeOrder(self.contract, order)
                         
                         self.daily_pnl += result['pnl']
                         self.capital += result['pnl']
-                        
+                    
                     elif result['action'] == 'trail_stop':
                         if result['rr'] >= 2:
                             logger.info("")
@@ -252,14 +250,11 @@ class LiveTradingV1:
                         logger.info(f"   盈亏: ${result['pnl']:.2f} | RR: {result.get('rr', 0):.1f}R")
                         logger.info("=" * 60)
                         
-                        # 发送平仓订单
                         remaining_size = self.strategy.active_trade.get('size', 0)
                         if remaining_size > 0:
                             action = 'SELL' if self.strategy.active_trade['action'] == 'BUY' else 'BUY'
-                            self.ib.placeOrder(
-                                self.contract,
-                                self.ib.marketOrder(action, remaining_size)
-                            )
+                            order = self.ib.marketOrder(action, remaining_size)
+                            self.ib.placeOrder(self.contract, order)
                         
                         self.daily_pnl += result['pnl']
                         self.capital += result['pnl']
@@ -272,7 +267,7 @@ class LiveTradingV1:
                             'time': now
                         })
                 
-                await asyncio.sleep(60)
+                await asyncio.sleep(30)
                 
             except Exception as e:
                 logger.error(f"交易错误: {e}")
