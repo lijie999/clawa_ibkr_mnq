@@ -1,17 +1,11 @@
 """
-ICT/SMC V1.0 交易策略 (多时间框架版)
+ICT/SMC V2.0 交易策略 (多时间框架版)
 
-移动止损策略:
-- 1.5R 半仓平仓，止损移至 +0.5R
-- 2R 止损移至 +1R
-- 3R 止损移至 +2R
-- 4R 止盈离场
-
-多时间框架分析:
-- 4hr: 确定主要趋势
-- 1hr: 确认趋势方向
-- 15min: 寻找入场信号
-- 5min: 精确入场时机
+改进点:
+1. FVG过滤 - 只保留近期有效FVG
+2. 趋势确认增强 - 检查更高时间框架
+3. 信号质量提高 - 多个条件确认
+4. 止损止盈设置优化
 """
 
 import pandas as pd
@@ -22,15 +16,13 @@ from config import Config
 from logger import logger
 
 
-class ICTSMCV1Strategy:
-    """ICT/SMC V1.0 交易策略"""
+class ICTSMCV2Strategy:
+    """ICT/SMC V2.0 交易策略"""
     
     def __init__(self):
-        self.order_blocks = []
-        self.fvgs = []
-        self.liquidity_levels = []
         self.active_trade = None
         self.last_signal_time = None
+        self.last_fvg_time = None
         
         self.TRAIL_LEVELS = {
             1.5: {'action': 'partial', 'trail_stop': 0.5},
@@ -40,23 +32,19 @@ class ICTSMCV1Strategy:
         }
     
     def is_trading_session(self, dt) -> Optional[str]:
-        """检查是否在交易时段 (CST = UTC-6)
-        
-        交易时段: 07:00 - 20:00 CST
-        """
+        """检查是否在交易时段 (CST = UTC-6)"""
         hour = dt.hour
         if hour >= 7 and hour < 20:
             return 'extended'
         return None
     
-    def analyze_market_structure(self, data: pd.DataFrame) -> Dict:
-        """分析市场结构"""
+    def get_trend(self, data: pd.DataFrame) -> str:
+        """判断趋势 - 简化版"""
         if len(data) < 5:
-            return {'trend': 'unknown', 'bos': False, 'choch': False}
+            return 'unknown'
         
         highs = data['high'].values
         lows = data['low'].values
-        closes = data['close'].values
         
         recent_high = highs[-1]
         recent_low = lows[-1]
@@ -64,33 +52,21 @@ class ICTSMCV1Strategy:
         prev_low = lows[-2]
         
         if recent_high > prev_high and recent_low > prev_low:
-            trend = 'bullish'
+            return 'bullish'
         elif recent_high < prev_high and recent_low < prev_low:
-            trend = 'bearish'
+            return 'bearish'
         else:
-            trend = 'ranging'
-        
-        bos = False
-        if trend == 'bullish' and recent_high > max(highs[-5:-1]):
-            bos = True
-        elif trend == 'bearish' and recent_low < min(lows[-5:-1]):
-            bos = True
-        
-        choch = False
-        if trend == 'bullish' and recent_low < prev_low:
-            choch = True
-        elif trend == 'bearish' and recent_high > prev_high:
-            choch = True
-        
-        return {'trend': trend, 'bos': bos, 'choch': choch}
+            return 'ranging'
     
-    def detect_fvg(self, data: pd.DataFrame, sensitivity: float = None) -> List[Dict]:
-        """检测公平价值缺口"""
+    def detect_fvg(self, data: pd.DataFrame, lookback: int = 10) -> List[Dict]:
+        """检测FVG - 只返回近期有效的"""
         fvgs = []
-        if sensitivity is None:
-            sensitivity = Config.FVG_SENSITIVITY
+        if len(data) < 3:
+            return fvgs
         
-        for i in range(2, len(data)):
+        sensitivity = Config.FVG_SENSITIVITY
+        
+        for i in range(max(2, len(data) - lookback), len(data)):
             prev = data.iloc[i-2]
             middle = data.iloc[i-1]
             curr = data.iloc[i]
@@ -106,7 +82,8 @@ class ICTSMCV1Strategy:
                         'low': prev['high'],
                         'high': curr['low'],
                         'gap': gap,
-                        'index': i
+                        'index': i,
+                        'time': data.index[i]
                     })
             
             elif curr['high'] < prev['low']:
@@ -120,142 +97,127 @@ class ICTSMCV1Strategy:
                         'low': curr['high'],
                         'high': prev['low'],
                         'gap': gap,
-                        'index': i
+                        'index': i,
+                        'time': data.index[i]
                     })
         
         return fvgs
     
-    def find_liquidity(self, data: pd.DataFrame) -> Tuple[float, float]:
-        """寻找流动性水平"""
+    def get_liquidity(self, data: pd.DataFrame) -> Tuple[float, float]:
+        """获取流动性水平"""
         recent_highs = data['high'].tail(20).nlargest(3)
         recent_lows = data['low'].tail(20).nsmallest(3)
         return float(recent_highs.max()), float(recent_lows.min())
     
-    def analyze_multi_timeframe(self, data: Dict[str, pd.DataFrame]) -> Dict:
-        """多时间框架分析
-        
-        Args:
-            data: {'4hr': df, '1hr': df, '15min': df, '5min': df}
-        
-        Returns:
-            综合分析结果
-        """
+    def analyze_mtf_alignment(self, data: Dict[str, pd.DataFrame]) -> Dict:
+        """多时间框架对齐分析"""
         result = {
             'trend_4hr': 'unknown',
             'trend_1hr': 'unknown',
             'trend_15min': 'unknown',
-            'fvg_aligned': False,
-            'liquidity_bias': None,
-            'direction': None,
-            'confidence': 0.0
+            'fvg_bullish': False,
+            'fvg_bearish': False,
+            'liquidity_high': 0,
+            'liquidity_low': 0,
+            'alignment_score': 0,
+            'direction': None
         }
         
-        # 1. 4小时图确定主要趋势
-        if '4hr' in data and len(data['4hr']) >= 5:
-            structure_4hr = self.analyze_market_structure(data['4hr'])
-            result['trend_4hr'] = structure_4hr['trend']
+        if not data or not data.get('15min') or data['15min'].empty:
+            return result
         
-        # 2. 1小时图确认趋势
-        if '1hr' in data and len(data['1hr']) >= 5:
-            structure_1hr = self.analyze_market_structure(data['1hr'])
-            result['trend_1hr'] = structure_1hr['trend']
+        df_15min = data['15min']
+        df_1hr = data.get('1hr', pd.DataFrame())
+        df_4hr = data.get('4hr', pd.DataFrame())
         
-        # 3. 15分钟图寻找信号
-        if '15min' in data and len(data['15min']) >= 10:
-            structure_15min = self.analyze_market_structure(data['15min'])
-            result['trend_15min'] = structure_15min['trend']
+        result['trend_4hr'] = self.get_trend(df_4hr) if len(df_4hr) >= 5 else 'unknown'
+        result['trend_1hr'] = self.get_trend(df_1hr) if len(df_1hr) >= 5 else 'unknown'
+        result['trend_15min'] = self.get_trend(df_15min)
         
-        # 4. 检查FVG对齐
-        for tf in ['1hr', '15min', '5min']:
-            if tf in data:
-                fvgs = self.detect_fvg(data[tf])
-                if fvgs:
-                    result['fvg_aligned'] = True
-                    break
+        high_liq, low_liq = self.get_liquidity(df_15min)
+        result['liquidity_high'] = high_liq
+        result['liquidity_low'] = low_liq
         
-        # 5. 流动性分析
-        if '15min' in data:
-            high_liq, low_liq = self.find_liquidity(data['15min'])
-            result['liquidity_high'] = high_liq
-            result['liquidity_low'] = low_liq
+        fvgs = self.detect_fvg(df_15min)
+        for fvg in fvgs:
+            if fvg['type'] == 'bullish':
+                result['fvg_bullish'] = True
+            elif fvg['type'] == 'bearish':
+                result['fvg_bearish'] = True
         
-        # 6. 确定交易方向（多时间框架对齐）
-        trend_4hr = result['trend_4hr']
-        trend_1hr = result['trend_1hr']
-        trend_15min = result['trend_15min']
+        score = 0
+        direction = None
         
-        # 牛市对齐
-        if trend_4hr == 'bullish' and trend_1hr in ['bullish', 'ranging'] and trend_15min == 'bullish':
-            result['direction'] = 'BUY'
-            result['confidence'] = 0.85
-        # 熊市对齐
-        elif trend_4hr == 'bearish' and trend_1hr in ['bearish', 'ranging'] and trend_15min == 'bearish':
-            result['direction'] = 'SELL'
-            result['confidence'] = 0.85
-        # 次级确认
-        elif trend_15min == 'bullish' and result['fvg_aligned']:
-            result['direction'] = 'BUY'
-            result['confidence'] = 0.6
-        elif trend_15min == 'bearish' and result['fvg_aligned']:
-            result['direction'] = 'SELL'
-            result['confidence'] = 0.6
-        else:
-            result['direction'] = None
-            result['confidence'] = 0.0
+        if result['trend_4hr'] == 'bullish':
+            score += 2
+        elif result['trend_4hr'] == 'bearish':
+            score -= 2
+        
+        if result['trend_1hr'] == 'bullish':
+            score += 2
+        elif result['trend_1hr'] == 'bearish':
+            score -= 2
+        elif result['trend_1hr'] == 'ranging':
+            score += 1
+        
+        if result['trend_15min'] == 'bullish' and result['fvg_bullish']:
+            score += 3
+            direction = 'BUY'
+        elif result['trend_15min'] == 'bearish' and result['fvg_bearish']:
+            score -= 3
+            direction = 'SELL'
+        
+        result['alignment_score'] = score
+        result['direction'] = direction
         
         return result
     
     def generate_signal(self, data: Dict[str, pd.DataFrame], current_price: float,
                         current_time: datetime = None) -> Optional[Dict]:
-        """生成交易信号（多时间框架版）
-        
-        Args:
-            data: {'4hr': df, '1hr': df, '15min': df, '5min': df}
-            current_price: 当前价格
-            current_time: 当前时间
-        """
+        """生成交易信号"""
         if self.active_trade:
             return None
         
-        # 防重复信号（5分钟内不重复）
-        if self.last_signal_time and current_time:
+        if current_time and self.last_signal_time:
             if (current_time - self.last_signal_time).total_seconds() < 300:
                 return None
         
-        # 多时间框架分析
-        mtf_analysis = self.analyze_multi_timeframe(data)
-        
-        direction = mtf_analysis['direction']
-        confidence = mtf_analysis['confidence']
-        
-        if not direction or confidence < 0.5:
+        if not data or not data.get('15min') or data['15min'].empty:
             return None
         
-        # 获取15分钟数据做精细分析
-        df_15min = data.get('15min', pd.DataFrame())
-        if df_15min.empty or len(df_15min) < 20:
+        df_15min = data['15min']
+        if len(df_15min) < 20:
             return None
         
-        # 检查FVG
+        mtf = self.analyze_mtf_alignment(data)
+        direction = mtf['direction']
+        
+        if not direction:
+            return None
+        
+        confidence = 0.5
+        
+        if mtf['alignment_score'] >= 5:
+            confidence = 0.85
+        elif mtf['alignment_score'] >= 3:
+            confidence = 0.7
+        
+        if mtf['trend_4hr'] == direction.lower():
+            confidence += 0.1
+        
         fvgs = self.detect_fvg(df_15min)
-        valid_fvg = False
-        
-        for fvg in fvgs[-5:]:
+        for fvg in fvgs[-3:]:
             if direction == 'BUY' and fvg['type'] == 'bullish':
                 if fvg['low'] <= current_price <= fvg['high'] + 10:
-                    valid_fvg = True
+                    confidence += 0.15
                     break
             elif direction == 'SELL' and fvg['type'] == 'bearish':
                 if fvg['high'] >= current_price >= fvg['low'] - 10:
-                    valid_fvg = True
+                    confidence += 0.15
                     break
         
-        if not valid_fvg:
-            return None
-        
-        # 流动性确认
-        high_liq = mtf_analysis.get('liquidity_high', current_price)
-        low_liq = mtf_analysis.get('liquidity_low', current_price)
+        high_liq = mtf['liquidity_high']
+        low_liq = mtf['liquidity_low']
         
         if direction == 'BUY':
             if high_liq <= current_price:
@@ -268,18 +230,8 @@ class ICTSMCV1Strategy:
             risk_distance = high_liq + 5 - current_price
             stop_loss = high_liq + 5
         
-        if risk_distance <= 0:
+        if risk_distance <= 0 or risk_distance > 100:
             return None
-        
-        # 增强置信度
-        confidence = min(confidence + 0.1 * len(fvgs[-10:]), 0.95)
-        
-        # 添加BOS加分
-        structure = self.analyze_market_structure(df_15min)
-        if structure['bos']:
-            confidence += 0.1
-        if structure['choch']:
-            confidence += 0.05
         
         self.last_signal_time = current_time
         
@@ -290,14 +242,14 @@ class ICTSMCV1Strategy:
             'risk_distance': risk_distance,
             'take_profit': current_price + risk_distance * 4 if direction == 'BUY' else current_price - risk_distance * 4,
             'confidence': min(confidence, 1.0),
-            'trend_4hr': mtf_analysis['trend_4hr'],
-            'trend_1hr': mtf_analysis['trend_1hr'],
-            'trend_15min': mtf_analysis['trend_15min'],
-            'mtf_analysis': mtf_analysis
+            'trend_4hr': mtf['trend_4hr'],
+            'trend_1hr': mtf['trend_1hr'],
+            'trend_15min': mtf['trend_15min'],
+            'alignment_score': mtf['alignment_score']
         }
     
     def update_trade(self, current_price: float, current_time) -> Dict:
-        """更新活跃交易，返回操作指令"""
+        """更新交易状态"""
         if not self.active_trade:
             return {'action': 'hold'}
         
@@ -403,10 +355,7 @@ class ICTSMCV1Strategy:
     def get_status(self) -> Dict:
         """获取策略状态"""
         if self.active_trade:
-            return {
-                'status': 'active',
-                'trade': self.active_trade
-            }
+            return {'status': 'active', 'trade': self.active_trade}
         return {'status': 'idle'}
     
     def reset(self):
@@ -416,7 +365,7 @@ class ICTSMCV1Strategy:
 
 
 class RiskManagerV1:
-    """V1.0 风险管理器"""
+    """风险管理器"""
     
     def __init__(self):
         self.max_position = Config.MAX_POSITION_SIZE
@@ -424,7 +373,6 @@ class RiskManagerV1:
     
     def calculate_position_size(self, capital: float, entry_price: float, 
                              stop_loss: float) -> int:
-        """计算仓位大小"""
         if capital <= 0:
             return 0
         
@@ -438,7 +386,6 @@ class RiskManagerV1:
         return min(size, self.max_position)
     
     def should_trade(self, capital: float, daily_pnl: float) -> bool:
-        """检查是否可以交易"""
         daily_loss_limit = capital * (Config.DAILY_LOSS_LIMIT / 100)
         if abs(daily_pnl) >= daily_loss_limit:
             return False
@@ -448,11 +395,9 @@ class RiskManagerV1:
 
 
 STRATEGY_CONFIG = {
-    'version': 'V1.0',
-    'name': 'ICT/SMC 移动止损策略 (多时间框架)',
-    'sessions': {
-        'extended': {'start': 7, 'end': 20, 'tz': 'CST'}
-    },
+    'version': 'V2.0',
+    'name': 'ICT/SMC 移动止损策略 V2.0',
+    'sessions': {'extended': {'start': 7, 'end': 20, 'tz': 'CST'}},
     'trail_stops': {
         '1.5R': {'action': 'partial', 'trail_stop': 0.5},
         '2R': {'action': 'trail', 'trail_stop': 1.0},
@@ -463,18 +408,11 @@ STRATEGY_CONFIG = {
         '4hr': '主要趋势',
         '1hr': '趋势确认',
         '15min': '入场信号',
-        '5min': '精确入场',
-        '1min': '数据存储'
+        '5min': '精确入场'
     },
     'risk': {
         'max_position': Config.MAX_POSITION_SIZE,
         'risk_per_trade': Config.RISK_PERCENTAGE,
         'daily_loss_limit': Config.DAILY_LOSS_LIMIT
-    },
-    'backtest_results': {
-        'final_capital': 163112.25,
-        'return': '63.11%',
-        'trades': 400,
-        'win_rate': '43.2%'
     }
 }

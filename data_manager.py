@@ -1,9 +1,9 @@
 """
-数据管理器
+数据管理器 V2.0
 
 职责:
 1. 从IBKR获取实时1分钟K线数据
-2. 追加存储到本地CSV文件
+2. 增量更新，高效存储
 3. 聚合生成多时间框架K线
 4. 提供统一的数据访问接口
 """
@@ -17,12 +17,11 @@ from logger import logger
 
 
 class DataManager:
-    """实时数据管理器"""
+    """实时数据管理器 V2.0 - 增量更新版"""
     
     def __init__(self):
         self.ib = None
         self.contract = None
-        self.data_dirty = False
         
         self.df_1min = pd.DataFrame()
         self.df_5min = pd.DataFrame()
@@ -30,24 +29,47 @@ class DataManager:
         self.df_1hr = pd.DataFrame()
         self.df_4hr = pd.DataFrame()
         
-        self.timeframes = {
-            '1min': None,
-            '5min': None,
-            '15min': None,
-            '1hr': None,
-            '4hr': None,
-        }
-        
         self.historical_file = 'mnq_1min_20260209_010602.csv'
         self.live_file = 'mnq_1min_live.csv'
+        
+        self._last_bar_time = None
+    
+    def _to_naive_datetime(self, dt):
+        """转换到无时区datetime"""
+        if isinstance(dt, str):
+            dt = pd.to_datetime(dt, utc=True)
+        if hasattr(dt, 'tz') and dt.tz is not None:
+            dt = dt.tz_localize(None)
+        return dt
+    
+    def _ensure_datetimeindex(self, df):
+        """确保DataFrame有DatetimeIndex"""
+        if df.empty:
+            return df
+        if not isinstance(df.index, pd.DatetimeIndex):
+            df.index = pd.to_datetime(df.index, utc=True)
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+        return df
+    
+    def _convert_bar(self, bar):
+        """转换IBKR K线数据"""
+        dt = self._to_naive_datetime(bar.date)
+        return {
+            'date': dt,
+            'open': float(bar.open),
+            'high': float(bar.high),
+            'low': float(bar.low),
+            'close': float(bar.close),
+            'volume': int(bar.volume)
+        }
     
     def initialize(self, ib, contract):
         """初始化数据管理器"""
         self.ib = ib
         self.contract = contract
         
-        self._load_historical_data()
-        self._sync_latest_data()
+        self._load_all_data()
         self._aggregate_all_timeframes()
         
         logger.info(f"✅ DataManager初始化完成")
@@ -57,120 +79,56 @@ class DataManager:
         logger.info(f"   1hr: {len(self.df_1hr)} 根")
         logger.info(f"   4hr: {len(self.df_4hr)} 根")
     
-    def _ensure_datetimeindex(self, df):
-        """确保DataFrame有DatetimeIndex且无时区"""
-        if df.empty:
-            return df
-        if not isinstance(df.index, pd.DatetimeIndex):
-            df.index = pd.to_datetime(df.index, utc=True)
-        # 移除时区信息，统一使用无时区
-        if df.index.tz is not None:
-            df.index = df.index.tz_localize(None)
-        return df
-    
-    def _convert_ibkr_bar(self, bar):
-        """转换IBKR K线数据"""
-        dt = pd.to_datetime(bar.date, utc=True)
-        dt = dt.tz_localize(None)
-        return {
-            'date': dt,
-            'open': bar.open,
-            'high': bar.high,
-            'low': bar.low,
-            'close': bar.close,
-            'volume': bar.volume
-        }
-    
-    def _load_historical_data(self):
-        """加载历史1分钟数据"""
+    def _load_all_data(self):
+        """加载所有数据"""
         import os
         
+        df_merged = pd.DataFrame()
+        
         if os.path.exists(self.historical_file):
-            df = pd.read_csv(self.historical_file, parse_dates=['date'])
-            df.set_index('date', inplace=True)
-            df = self._ensure_datetimeindex(df)
-            self.df_1min = df
-            logger.info(f"✅ 加载历史数据: {len(df)} 根1分钟K线")
+            df_hist = pd.read_csv(self.historical_file, parse_dates=['date'])
+            df_hist.set_index('date', inplace=True)
+            df_hist = self._ensure_datetimeindex(df_hist)
+            df_merged = df_hist
+            logger.info(f"✅ 历史数据: {len(df_hist)} 根")
         
         if os.path.exists(self.live_file):
             df_live = pd.read_csv(self.live_file, parse_dates=['date'])
             df_live.set_index('date', inplace=True)
             df_live = self._ensure_datetimeindex(df_live)
-            
-            if not self.df_1min.empty:
-                combined = pd.concat([self.df_1min, df_live])
-                combined = combined[~combined.index.duplicated(keep='last')]
-                combined = combined.sort_index()
-                self.df_1min = combined.tail(2880)
+            if not df_merged.empty:
+                df_merged = pd.concat([df_merged, df_live])
+                df_merged = df_merged[~df_merged.index.duplicated(keep='last')]
+                df_merged = df_merged.sort_index()
             else:
-                self.df_1min = df_live.tail(2880)
-            
-            logger.info(f"✅ 合并实时数据: {len(df_live)} 根")
-    
-    def _sync_latest_data(self):
-        """同步IBKR最新数据"""
-        if not self.ib or not self.ib.isConnected():
-            logger.warning("IBKR未连接，跳过同步")
-            return
+                df_merged = df_live
+            logger.info(f"✅ 实时数据: {len(df_live)} 根")
         
-        try:
-            bars = self.ib.reqHistoricalData(
-                self.contract,
-                endDateTime='',
-                durationStr='2 D',
-                barSizeSetting='1 min',
-                whatToShow='TRADES',
-                useRTH=True,
-                formatDate=1
-            )
-            
-            if not bars:
-                logger.warning("未获取到K线数据")
-                return
-            
-            df_new = pd.DataFrame([self._convert_ibkr_bar(bar) for bar in bars])
-            df_new.set_index('date', inplace=True)
-            
-            if not self.df_1min.empty:
-                combined = pd.concat([self.df_1min, df_new])
-                combined = combined[~combined.index.duplicated(keep='last')]
-                combined = combined.sort_index()
-            else:
-                combined = df_new
-            
-            self.df_1min = combined.tail(2880)
+        if not df_merged.empty:
+            self.df_1min = df_merged.tail(2880)
+            self._last_bar_time = self.df_1min.index[-1]
             self._save_live_data()
-            
-            logger.info(f"✅ 同步完成: {len(df_new)} 根新数据")
-            
-        except Exception as e:
-            logger.error(f"同步数据失败: {e}")
     
     def _save_live_data(self):
         """保存实时数据到CSV"""
+        import os
         try:
             self.df_1min.to_csv(self.live_file)
-            logger.debug(f"💾 保存实时数据: {len(self.df_1min)} 根")
+            logger.debug(f"💾 保存: {len(self.df_1min)} 根")
         except Exception as e:
-            logger.error(f"保存数据失败: {e}")
+            logger.error(f"保存失败: {e}")
     
     def _aggregate_all_timeframes(self):
         """聚合所有时间框架"""
         if self.df_1min.empty:
             return
         
-        self.df_5min = self._resample_dataframe(self.df_1min, '5min')
-        self.df_15min = self._resample_dataframe(self.df_1min, '15min')
-        self.df_1hr = self._resample_dataframe(self.df_1min, '60min')
-        self.df_4hr = self._resample_dataframe(self.df_1min, '240min')
-        
-        self.timeframes['1min'] = self.df_1min
-        self.timeframes['5min'] = self.df_5min
-        self.timeframes['15min'] = self.df_15min
-        self.timeframes['1hr'] = self.df_1hr
-        self.timeframes['4hr'] = self.df_4hr
+        self.df_5min = self._resample(self.df_1min, '5min')
+        self.df_15min = self._resample(self.df_1min, '15min')
+        self.df_1hr = self._resample(self.df_1min, '60min')
+        self.df_4hr = self._resample(self.df_1min, '240min')
     
-    def _resample_dataframe(self, df: pd.DataFrame, freq: str) -> pd.DataFrame:
+    def _resample(self, df: pd.DataFrame, freq: str) -> pd.DataFrame:
         """聚合K线"""
         if df.empty:
             return pd.DataFrame()
@@ -185,8 +143,8 @@ class DataManager:
         
         return resampled
     
-    def update(self):
-        """更新数据（每1分钟调用）"""
+    def update(self) -> bool:
+        """更新数据 - 增量获取最新K线"""
         if not self.ib or not self.ib.isConnected():
             return False
         
@@ -194,7 +152,7 @@ class DataManager:
             bars = self.ib.reqHistoricalData(
                 self.contract,
                 endDateTime='',
-                durationStr='1 D',
+                durationStr='2 D',
                 barSizeSetting='1 min',
                 whatToShow='TRADES',
                 useRTH=True,
@@ -204,34 +162,42 @@ class DataManager:
             if not bars:
                 return False
             
-            new_bar = pd.DataFrame([self._convert_ibkr_bar(bars[-1])])
-            new_bar.set_index('date', inplace=True)
+            df_new = pd.DataFrame([self._convert_bar(bar) for bar in bars])
+            df_new.set_index('date', inplace=True)
+            df_new = df_new[~df_new.index.duplicated(keep='last')]
+            df_new = df_new.sort_index()
             
-            if not self.df_1min.empty:
-                last_time = self.df_1min.index[-1]
-                new_time = new_bar.index[0]
-                
-                if new_time <= last_time:
-                    return False
+            if self._last_bar_time is not None:
+                df_new = df_new[df_new.index > self._last_bar_time]
             
-            self.df_1min = pd.concat([self.df_1min, new_bar])
+            if df_new.empty:
+                return False
+            
+            self.df_1min = pd.concat([self.df_1min, df_new])
             self.df_1min = self.df_1min[~self.df_1min.index.duplicated(keep='last')]
             self.df_1min = self.df_1min.tail(2880)
             
+            self._last_bar_time = self.df_1min.index[-1]
             self._save_live_data()
             self._aggregate_all_timeframes()
             
-            logger.debug(f"📊 新K线: {new_bar.index[0]} | O:{new_bar.iloc[0]['open']} H:{new_bar.iloc[0]['high']} L:{new_bar.iloc[0]['low']} C:{new_bar.iloc[0]['close']}")
-            
+            logger.debug(f"📊 新增{len(df_new)}根K线 | 最新: {self._last_bar_time}")
             return True
             
         except Exception as e:
-            logger.error(f"更新数据失败: {e}")
+            logger.error(f"数据更新失败: {e}")
             return False
     
     def get_data(self, timeframe: str = '15min') -> pd.DataFrame:
         """获取指定时间框架数据"""
-        return self.timeframes.get(timeframe, pd.DataFrame())
+        tf_map = {
+            '1min': self.df_1min,
+            '5min': self.df_5min,
+            '15min': self.df_15min,
+            '1hr': self.df_1hr,
+            '4hr': self.df_4hr,
+        }
+        return tf_map.get(timeframe, pd.DataFrame())
     
     def get_current_price(self) -> float:
         """获取当前价格"""
